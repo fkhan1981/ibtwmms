@@ -1,0 +1,184 @@
+name: CI/CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: 'The Dockerfile to use for the docker image build'
+        default: 'MSR/Dockerfile'
+        required: true
+        type: string
+      baseImage:
+        description: 'The base webMethods product image to use'
+        default: 'sagcr.azurecr.io/microservicesruntime-wpm:10.15'
+        required: false
+        type: string
+      dockerImage:
+        description: 'Repository and Tag segments of the solution docker image to build (repository:tag)'
+        default: 'msr:dev'
+        required: true
+        type: string
+      wmPackages:
+        description: 'List of webMethods packages that you need on top of the base runtime (space-separated)'
+        default: ''
+        type: string
+      wpmRegistry:
+        description: 'The sub-registry in https://packages.webmethods.io to use for installing webMethods packages'
+        default: 'licensed'
+        type: string
+      customPackages:
+        description: 'List of custom packages that you need on top of the base runtime (space-separated)'
+        default: ''
+        type: string
+      customPackagesOrgUrl:
+        description: 'GitHub organization URL for the above custom packages'
+        default: ''
+        type: string
+      deploymentHelmChart:
+        description: 'The name of the Helm chart to deploy'
+        default: 'webMethods/microservicesruntime'
+        required: true
+        type: string
+      deploymentReleaseName:
+        description: 'Name of the solution deployment release to install or upgrade'
+        default: 'msr'
+        required: true
+        type: string
+  workflow_call: # Support for reusable workflows. Example: Have the current workflow code executed multiple times per single microservice in a parent workflow that handles the entire solution.
+    inputs:
+      dockerfile:
+        description: 'The Dockerfile to use for the docker image build'
+        default: 'MSR/Dockerfile'
+        required: true
+        type: string
+      baseImage:
+        description: 'The base webMethods product image to use'
+        default: 'sagcr.azurecr.io/microservicesruntime-wpm:10.15'
+        required: false
+        type: string
+      dockerImage:
+        description: 'Repository and Tag segments of the solution docker image to build (repository:tag)'
+        default: 'msr:dev'
+        required: true
+        type: string
+      wmPackages:
+        description: 'List of webMethods AG packages that you need on top of the base runtime (space-separated)'
+        default: ''
+        type: string
+      wpmRegistry:
+        description: 'The sub-registry in https://packages.webmethods.io to use for installing webMethods packages'
+        default: 'licensed'
+        type: string
+      customPackages:
+        description: 'List of custom packages that you need on top of the base runtime (spece-separated)'
+        default: ''
+        type: string
+      customPackagesOrgUrl:
+        description: 'GitHub organization URL for the above custom packages'
+        default: ''
+        type: string
+      deploymentHelmChart:
+        description: 'The name of the Helm chart to deploy'
+        default: 'webMethods/microservicesruntime'
+        required: true
+        type: string
+      deploymentReleaseName:
+        description: 'Name of the solution deployment release to install or upgrade'
+        default: 'msr'
+        required: true
+        type: string
+
+env:
+  WM_CR_USER: ${{ secrets.WM_CR_USER }}
+  WM_CR_PASSWORD: ${{ secrets.WM_CR_PASSWORD }}
+  WM_WPM_TOKEN: ${{ secrets.WM_WPM_TOKEN }}
+  
+  DOCKER_USER: ${{ secrets.DOCKER_USER }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+
+  KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+
+jobs:
+  init:
+    name: Initialize and Validate inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Validate inputs
+        run: |
+          ./scripts/validate_input.sh WM_CR_USER "${WM_CR_USER}"
+          ./scripts/validate_input.sh WM_CR_PASSWORD "${WM_CR_PASSWORD}"
+          ./scripts/validate_input.sh WM_WPM_TOKEN "${WM_WPM_TOKEN}"
+          ./scripts/validate_input.sh DOCKER_USER "${DOCKER_USER}"
+          ./scripts/validate_input.sh DOCKER_PASSWORD "${DOCKER_PASSWORD}"
+          ./scripts/validate_input.sh DOCKER_REGISTRY "${DOCKER_REGISTRY}"
+          ./scripts/validate_input.sh KUBE_CONFIG "${KUBE_CONFIG}"
+
+  build:
+    needs: [init]
+    name: Build Image
+    runs-on: ubuntu-latest
+    outputs:
+      imageRepository: ${{ steps.build-image.outputs.image-repository }}
+      imageTag: ${{ steps.build-image.outputs.image-tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to webMethods Container Registry
+        run: docker login -u ${WM_CR_USER} -p ${WM_CR_PASSWORD} sagcr.azurecr.io
+          
+      - name: Build custom image
+        id: build-image
+        uses: wm-private-cloud/wm-build-image@v2
+        with:
+          context: "."
+          dockerfile: ${{ inputs.dockerfile }}
+          base-runtime: ${{ inputs.baseImage }}
+          image-name: ${DOCKER_REGISTRY}/${{ inputs.dockerImage }}
+          wpm-registry: ${{ inputs.wpmRegistry }}
+          wpm-registry-token: ${WM_WPM_TOKEN}
+          packages: ${{ inputs.wmPackages }}
+          custom-packages: ${{ inputs.customPackages }}
+          custom-packages-org-url: ${{ inputs.customPackagesOrgUrl }}
+
+      - name: Push custom image to organization container registry  
+        run: |
+          docker login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD} ${DOCKER_REGISTRY}
+          docker push ${DOCKER_REGISTRY}/${{ inputs.dockerImage }}
+
+  deploy:
+    needs: [build]
+    name: Deploy Solution
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFIG: ${{ github.workspace }}/${{ github.run_number }}-kubeconf
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate against Kubernetes cluster
+        run: echo "${KUBE_CONFIG}" > ${KUBECONFIG}
+      
+      - name: Add webMethods Helm Charts repository
+        uses: wm-private-cloud/wm-helm-add-repo@v3
+        
+      - name: Deploy solution
+        uses: wm-private-cloud/wm-helm-deploy@v3
+        with: 
+          release-name: ${{ inputs.deploymentReleaseName }}
+          helm-chart: ${{ inputs.deploymentHelmChart }}
+          docker-registry: ${DOCKER_REGISTRY}
+          docker-username: ${DOCKER_USER}
+          docker-password: ${DOCKER_PASSWORD}
+          extra-args: >- 
+            --set "image.repository=${{ needs.build.outputs.imageRepository }}"
+            --set "image.tag=${{ needs.build.outputs.imageTag }}" 
+      
+      - name: Cleanup runner
+        if: always()
+        run: rm -rf ${KUBECONFIG}
